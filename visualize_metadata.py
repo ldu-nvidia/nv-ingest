@@ -1,71 +1,7 @@
-from nv_ingest_client.client import Ingestor
-from nv_ingest_client.util.file_processing.extract import extract_file_content
-from base64 import b64decode
-import time, logging
-
-from IPython import display
 from collections import Counter
 from typing import List, Dict, Any
 from base64 import b64decode
 from IPython.display import display, Image
-
-
-
-ACCESS_KEY="minioadmin"
-SECRET_KEY="minioadmin"
-BUCKET_NAME="nv-ingest"
-params = {"access_key": ACCESS_KEY, "secret_key": SECRET_KEY, "bucket_name": BUCKET_NAME}
-import os
-
-# client config
-HTTP_HOST = os.environ.get('HTTP_HOST', "localhost")
-HTTP_PORT = os.environ.get('HTTP_PORT', "7670")
-TASK_QUEUE = os.environ.get('TASK_QUEUE', "morpheus_task_queue")
-
-# minio config
-MINIO_ACCESS_KEY = os.environ.get('MINIO_ACCESS_KEY', "minioadmin")
-MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY', "minioadmin")
-
-# time to wait for job to complete
-DEFAULT_JOB_TIMEOUT = 90
-
-
-# Load a sample PDF to demonstrate NV-Ingest usage.
-ingestor = (
-    Ingestor(message_client_hostname="localhost", message_client_port=7670)
-    .files("/home/ldu/Documents/Repos/nv-ingest/data/multimodal_test.pdf") # can be a list of files, or contain wildcards i.e. /some/path/*.pdf
-    .extract(
-        extract_text=True,
-        extract_tables=True,
-        extract_charts=True,
-        extract_images=True,
-    ).split(
-        split_by="word",
-        split_length=300,
-        split_overlap=10,
-        max_character_length=5000,
-        sentence_window_size=0,
-    ).embed( # whether to compute embeddings
-        text=True, tables=True
-    ).store( #
-        structured=True,
-        images=True,
-        store_method="minio",
-        params=params
-    ).store_embed(
-        params=params
-    ).vdb_upload( # load vectors into milvus for later retrieval
-      bulk_ingest=True,
-      params=params
-    )
-)
-
-print("starting to ingest file: " )
-generated_metadata = ingestor.ingest()
-print("finish ingesting file! ")
-
-
-
 
 def count_metadata_types(metadata: List[Dict[str, Any]]) -> Dict[str, int]:
     """
@@ -194,9 +130,10 @@ def print_metadata_summary(analysis: Dict[str, Any]):
         print(f"    Location: {image['location']}")
         print(f"    Page Number: {image['page_number']}")
 
-print("generated meta data is: ", generated_metadata)
-analysis = comprehensive_metadata_analysis(generated_metadata[0])  # One analyze first file result
+
+generated_meta_image = [{'image': "/home/ldu/Documents/Repos/nv-ingest/ASML_Snapdragon_parsed/image/snapdragon_600_apq_8064_data_sheet.pdf.metadata.json"}]
+analysis = comprehensive_metadata_analysis(generated_meta_image)  # One analyze first file result
 print_metadata_summary(analysis)
 
 # To display an image:
-#display_image(generated_metadata[0], 0)  # Display the first image
+display_image(generated_meta_image, 0)  # Display the first image
