@@ -1,7 +1,7 @@
 from pymilvus import (
     MilvusClient,
-    DataType,
     Collection,
+    DataType,
     CollectionSchema,
     connections,
     utility,
@@ -15,7 +15,9 @@ from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
 from pymilvus.model.sparse import BM25EmbeddingFunction
 from llama_index.embeddings.nvidia import NVIDIAEmbedding
 from scipy.sparse import csr_array
+from typing import List
 import time
+from urllib.parse import urlparse
 
 
 def create_nvingest_schema(dense_dim: int = 1024, sparse: bool = False) -> CollectionSchema:
@@ -134,7 +136,12 @@ def create_collection(
 
 
 def create_nvingest_collection(
-    collection_name: str, milvus_uri: str, sparse: bool = False, recreate: bool = True, gpu_cagra: bool = True
+    collection_name: str,
+    milvus_uri: str = "http://localhost:19530",
+    sparse: bool = False,
+    recreate: bool = True,
+    gpu_cagra: bool = True,
+    dense_dim: int = 2048,
 ) -> CollectionSchema:
     """
     Creates a milvus collection with an nv-ingest compatible schema under
@@ -145,7 +152,8 @@ def create_nvingest_collection(
     collection_name : str
         Name of the collection to be created.
     milvus_uri : str,
-        Milvus address with http(s) preffix and port.
+        Milvus address with http(s) preffix and port. Can also be a file path, to activate
+        milvus-lite.
     sparse : bool, optional
         When set to true, this adds a Sparse index to the IndexParams, usually activated for
         hybrid search.
@@ -154,6 +162,8 @@ def create_nvingest_collection(
         again with the provided information (schema, index_params).
     gpu_cagra : bool, optional
         If true, creates a GPU_CAGRA index for dense embeddings.
+    dense_dim : int, optional
+        Sets the dimension size for the dense embedding in the milvus schema.
 
     Returns
     -------
@@ -161,11 +171,22 @@ def create_nvingest_collection(
         Returns a milvus collection schema, that represents the fields in the created
         collection.
     """
+    if urlparse(milvus_uri).scheme:
+        connections.connect(uri=milvus_uri)
+        server_version = utility.get_server_version()
+        if "lite" in server_version:
+            gpu_cagra = False
+    else:
+        gpu_cagra = False
     client = MilvusClient(milvus_uri)
-    schema = create_nvingest_schema(sparse=sparse)
+    schema = create_nvingest_schema(dense_dim=dense_dim, sparse=sparse)
     index_params = create_nvingest_index_params(sparse=sparse, gpu_cagra=gpu_cagra)
     create_collection(client, collection_name, schema, index_params, recreate=recreate)
-    return schema
+
+
+def _format_sparse_embedding(sparse_vector: csr_array):
+    sparse_embedding = {int(k[1]): float(v) for k, v in sparse_vector.todok()._dict.items()}
+    return sparse_embedding if len(sparse_embedding) > 0 else {int(0): float(0)}
 
 
 def _record_dict(text, element, sparse_vector: csr_array = None):
@@ -176,7 +197,7 @@ def _record_dict(text, element, sparse_vector: csr_array = None):
         "content_metadata": element["metadata"]["content_metadata"],
     }
     if sparse_vector is not None:
-        record["sparse"] = {int(k[1]): float(v) for k, v in sparse_vector.todok()._dict.items()}
+        record["sparse"] = _format_sparse_embedding(sparse_vector)
     return record
 
 
@@ -260,7 +281,8 @@ def bulk_insert_milvus(collection_name: str, writer: RemoteBulkWriter, milvus_ur
         The Milvus Remote BulkWriter instance that was created with necessary
         params to access the minio instance corresponding to milvus.
     milvus_uri : str,
-        The location of the milvus instance where the selected collection exists.
+        Milvus address with http(s) preffix and port. Can also be a file path, to activate
+        milvus-lite.
     """
 
     connections.connect(uri=milvus_uri)
@@ -318,20 +340,15 @@ def create_bm25_model(
     return bm25_ef
 
 
-def write_to_nvingest_collection(
+def stream_insert_milvus(
     records,
+    client: MilvusClient,
     collection_name: str,
-    schema: CollectionSchema,
-    sparse: bool = False,
-    bm25_save_path: str = "bm25_model.json",
-    milvus_uri: str = "http://localhost:19530",
-    minio_endpoint: str = "localhost:9000",
-    access_key: str = "minioadmin",
-    secret_key: str = "minioadmin",
-    bucket_name: str = "a-bucket",
+    sparse_model=None,
     enable_text: bool = True,
     enable_charts: bool = True,
     enable_tables: bool = True,
+    record_func=_record_dict,
 ):
     """
     This function takes the input records and creates a corpus,
@@ -342,57 +359,141 @@ def write_to_nvingest_collection(
     ----------
     records : List
         List of chunks with attached metadata
-    collection : Collection
+    collection_name : str
         Milvus Collection to search against
-    schema : CollectionSchema,
-        Schema that identifies the fields of data that will be available in the collection.
-    sparse : bool, optional
-        When true, incorporates sparse embedding representations for records.
-    bm25_save_path : str, optional
-        The desired filepath for the sparse model if sparse is True.
-    milvus_uri : str,
-        Milvus address with http(s) preffix and port.
-    minio_endpoint : str,
-        Endpoint for the minio instance attached to your milvus.
-    access_key : str, optional
-        Minio access key.
-    secret_key : str, optional
-        Minio secret key.
-    bucket_name : str, optional
-        Minio bucket name.
+    sparse_model : model,
+        Sparse model used to generate sparse embedding in the form of
+        scipy.sparse.csr_array
     enable_text : bool, optional
         When true, ensure all text type records are used.
     enable_charts : bool, optional
         When true, ensure all chart type records are used.
     enable_tables : bool, optional
         When true, ensure all table type records are used.
-    """
-    # Connections parameters to access the remote bucket
-    conn = RemoteBulkWriter.S3ConnectParam(
-        endpoint=minio_endpoint,  # the default MinIO service started along with Milvus
-        access_key=access_key,
-        secret_key=secret_key,
-        bucket_name=bucket_name,
-        secure=False,
-    )
+    record_func : function, optional
+        This function will be used to parse the records for necessary information.
 
-    text_writer = RemoteBulkWriter(schema=schema, remote_path="/", connect_param=conn, file_type=BulkFileType.PARQUET)
+    """
+    data = []
+    for result in records:
+        for element in result:
+            text = _pull_text(element, enable_text, enable_charts, enable_tables)
+            if text:
+                if sparse_model is not None:
+                    data.append(record_func(text, element, sparse_model.encode_documents([text])))
+                else:
+                    data.append(record_func(text, element))
+    client.insert(collection_name=collection_name, data=data)
+
+
+def write_to_nvingest_collection(
+    records,
+    collection_name: str,
+    milvus_uri: str = "http://localhost:19530",
+    minio_endpoint: str = "localhost:9000",
+    sparse: bool = False,
+    enable_text: bool = True,
+    enable_charts: bool = True,
+    enable_tables: bool = True,
+    bm25_save_path: str = "bm25_model.json",
+    access_key: str = "minioadmin",
+    secret_key: str = "minioadmin",
+    bucket_name: str = "a-bucket",
+):
+    """
+    This function takes the input records and creates a corpus,
+    factoring in filters (i.e. texts, charts, tables) and fits
+    a BM25 model with that information.
+
+    Parameters
+    ----------
+    records : List
+        List of chunks with attached metadata
+    collection_name : str
+        Milvus Collection to search against
+    milvus_uri : str,
+        Milvus address with http(s) preffix and port. Can also be a file path, to activate
+        milvus-lite.
+    minio_endpoint : str,
+        Endpoint for the minio instance attached to your milvus.
+    enable_text : bool, optional
+        When true, ensure all text type records are used.
+    enable_charts : bool, optional
+        When true, ensure all chart type records are used.
+    enable_tables : bool, optional
+        When true, ensure all table type records are used.
+    sparse : bool, optional
+        When true, incorporates sparse embedding representations for records.
+    bm25_save_path : str, optional
+        The desired filepath for the sparse model if sparse is True.
+    access_key : str, optional
+        Minio access key.
+    secret_key : str, optional
+        Minio secret key.
+    bucket_name : str, optional
+        Minio bucket name.
+    """
+    stream = False
+    connections.connect(uri=milvus_uri)
+    if urlparse(milvus_uri).scheme:
+        server_version = utility.get_server_version()
+        if "lite" in server_version:
+            stream = True
+    else:
+        stream = True
     bm25_ef = None
     if sparse:
         bm25_ef = create_bm25_model(
             records, enable_text=enable_text, enable_charts=enable_charts, enable_tables=enable_tables
         )
         bm25_ef.save(bm25_save_path)
-    writer = write_records_minio(
-        records, text_writer, bm25_ef, enable_text=enable_text, enable_charts=enable_charts, enable_tables=enable_tables
-    )
-    bulk_insert_milvus(collection_name, writer, milvus_uri)
-    # this sleep is required, to ensure atleast this amount of time
-    # passes before running a search against the collection.
+    client = MilvusClient(milvus_uri)
+    schema = Collection(collection_name).schema
+    if stream:
+        stream_insert_milvus(
+            records,
+            client,
+            collection_name,
+            bm25_ef,
+            enable_text=enable_text,
+            enable_charts=enable_charts,
+            enable_tables=enable_tables,
+        )
+    else:
+        # Connections parameters to access the remote bucket
+        conn = RemoteBulkWriter.S3ConnectParam(
+            endpoint=minio_endpoint,  # the default MinIO service started along with Milvus
+            access_key=access_key,
+            secret_key=secret_key,
+            bucket_name=bucket_name,
+            secure=False,
+        )
+        text_writer = RemoteBulkWriter(
+            schema=schema, remote_path="/", connect_param=conn, file_type=BulkFileType.PARQUET
+        )
+        writer = write_records_minio(
+            records,
+            text_writer,
+            bm25_ef,
+            enable_text=enable_text,
+            enable_charts=enable_charts,
+            enable_tables=enable_tables,
+        )
+        bulk_insert_milvus(collection_name, writer, milvus_uri)
+        # this sleep is required, to ensure atleast this amount of time
+        # passes before running a search against the collection.\
     time.sleep(20)
 
 
-def dense_retrieval(queries, collection: Collection, dense_model, top_k: int, dense_field: str = "vector"):
+def dense_retrieval(
+    queries,
+    collection_name: str,
+    client: MilvusClient,
+    dense_model,
+    top_k: int,
+    dense_field: str = "vector",
+    output_fields: List[str] = ["text"],
+):
     """
     This function takes the input queries and conducts a dense
     embedding search against the dense vector and return the top_k
@@ -404,6 +505,8 @@ def dense_retrieval(queries, collection: Collection, dense_model, top_k: int, de
         List of queries
     collection : Collection
         Milvus Collection to search against
+    client : MilvusClient
+        Client connected to mivlus instance.
     dense_model : NVIDIAEmbedding
         Dense model to generate dense embeddings for queries.
     top_k : int
@@ -421,20 +524,27 @@ def dense_retrieval(queries, collection: Collection, dense_model, top_k: int, de
     for query in queries:
         dense_embeddings.append(dense_model.get_query_embedding(query))
 
-    results = collection.search(
-        data=dense_embeddings, anns_field=dense_field, param={"metric_type": "L2"}, limit=top_k, output_fields=["text"]
+    results = client.search(
+        collection_name=collection_name,
+        data=dense_embeddings,
+        anns_field=dense_field,
+        param={"metric_type": "L2"},
+        limit=top_k,
+        output_fields=output_fields,
     )
     return results
 
 
 def hybrid_retrieval(
     queries,
-    collection: Collection,
+    collection_name: str,
+    client: MilvusClient,
     dense_model,
     sparse_model,
     top_k: int,
     dense_field: str = "vector",
     sparse_field: str = "sparse",
+    output_fields: List[str] = ["text"],
 ):
     """
     This function takes the input queries and conducts a hybrid
@@ -447,6 +557,8 @@ def hybrid_retrieval(
         List of queries
     collection : Collection
         Milvus Collection to search against
+    client : MilvusClient
+        Client connected to mivlus instance.
     dense_model : NVIDIAEmbedding
         Dense model to generate dense embeddings for queries.
     sparse_model : model,
@@ -470,9 +582,7 @@ def hybrid_retrieval(
     sparse_embeddings = []
     for query in queries:
         dense_embeddings.append(dense_model.get_query_embedding(query))
-        sparse_embeddings.append(
-            {int(k[1]): float(v) for k, v in sparse_model.encode_queries([query]).todok()._dict.items()}
-        )
+        sparse_embeddings.append(_format_sparse_embedding(sparse_model.encode_queries([query])))
 
     # Create search requests for both vector types
     search_param_1 = {
@@ -493,14 +603,16 @@ def hybrid_retrieval(
     }
     sparse_req = AnnSearchRequest(**search_param_2)
 
-    results = collection.hybrid_search([sparse_req, dense_req], rerank=RRFRanker(), limit=top_k, output_fields=["text"])
+    results = client.hybrid_search(
+        collection_name, [sparse_req, dense_req], RRFRanker(), limit=top_k, output_fields=output_fields
+    )
     return results
 
 
 def nvingest_retrieval(
     queries,
     collection_name: str,
-    schema: CollectionSchema,
+    milvus_uri: str = "http://localhost:19530",
     top_k: int = 5,
     hybrid: bool = False,
     dense_field: str = "vector",
@@ -508,6 +620,7 @@ def nvingest_retrieval(
     embedding_endpoint="http://localhost:8000/v1",
     sparse_model_filepath: str = "bm25_model.json",
     model_name: str = "nvidia/nv-embedqa-e5-v5",
+    output_fields: List[str] = ["text", "source", "content_metadata"],
 ):
     """
     This function takes the input queries and conducts a hybrid/dense
@@ -520,8 +633,9 @@ def nvingest_retrieval(
         List of queries
     collection : Collection
         Milvus Collection to search against
-    schema: CollectionSchema
-        Schema that identifies the fields of data that will be available in the collection.
+    milvus_uri : str,
+        Milvus address with http(s) preffix and port. Can also be a file path, to activate
+        milvus-lite.
     top_k : int
         Number of search results to return per query.
     hybrid: bool, optional
@@ -545,12 +659,14 @@ def nvingest_retrieval(
         Nested list of top_k results per query.
     """
     embed_model = NVIDIAEmbedding(base_url=embedding_endpoint, model=model_name)
-    collection = Collection(name=collection_name, schema=schema)
+    client = MilvusClient(milvus_uri)
 
     if hybrid:
         bm25_ef = BM25EmbeddingFunction(build_default_analyzer(language="en"))
         bm25_ef.load(sparse_model_filepath)
-        results = hybrid_retrieval(queries, collection, embed_model, bm25_ef, top_k)
+        results = hybrid_retrieval(
+            queries, collection_name, client, embed_model, bm25_ef, top_k, output_fields=output_fields
+        )
     else:
-        results = dense_retrieval(queries, collection, embed_model, top_k)
+        results = dense_retrieval(queries, collection_name, client, embed_model, top_k, output_fields=output_fields)
     return results
