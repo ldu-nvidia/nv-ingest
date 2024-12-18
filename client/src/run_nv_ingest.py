@@ -1,21 +1,7 @@
-from nv_ingest_client.client import Ingestor
-from nv_ingest_client.util.file_processing.extract import extract_file_content
-from base64 import b64decode
-import time, logging
-
-from IPython import display
-from collections import Counter
-from typing import List, Dict, Any
-from base64 import b64decode
-from IPython.display import display, Image
-
-
-
-ACCESS_KEY="minioadmin"
-SECRET_KEY="minioadmin"
-BUCKET_NAME="nv-ingest"
-params = {"access_key": ACCESS_KEY, "secret_key": SECRET_KEY, "bucket_name": BUCKET_NAME}
 import os
+from PIL import Image
+from io import BytesIO
+import base64
 
 # client config
 HTTP_HOST = os.environ.get('HTTP_HOST', "localhost")
@@ -29,174 +15,116 @@ MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY', "minioadmin")
 # time to wait for job to complete
 DEFAULT_JOB_TIMEOUT = 90
 
+# sample input file and output directory
+SAMPLE_PDF = "/home/ldu/Documents/Repos/nv-ingest/data/ASML/snapdragon_600_apq_8064_data_sheet.pdf"
 
-# Load a sample PDF to demonstrate NV-Ingest usage.
-ingestor = (
-    Ingestor(message_client_hostname="localhost", message_client_port=7670)
-    .files("/home/ldu/Documents/Repos/nv-ingest/data/multimodal_test.pdf") # can be a list of files, or contain wildcards i.e. /some/path/*.pdf
-    .extract(
-        extract_text=True,
-        extract_tables=True,
-        extract_charts=True,
-        extract_images=True,
-    ).split(
-        split_by="word",
-        split_length=300,
-        split_overlap=10,
-        max_character_length=5000,
-        sentence_window_size=0,
-    ).embed( # whether to compute embeddings
-        text=True, tables=True
-    ).store( #
-        structured=True,
-        images=True,
-        store_method="minio",
-        params=params
-    ).store_embed(
-        params=params
-    ).vdb_upload( # load vectors into milvus for later retrieval
-      bulk_ingest=True,
-      params=params
-    )
+from base64 import b64decode
+import time
+
+from nv_ingest_client.client import NvIngestClient
+from nv_ingest_client.message_clients.rest.rest_client import RestClient
+from nv_ingest_client.primitives import JobSpec
+from nv_ingest_client.primitives.tasks import DedupTask
+from nv_ingest_client.primitives.tasks import EmbedTask
+from nv_ingest_client.primitives.tasks import ExtractTask
+from nv_ingest_client.primitives.tasks import FilterTask
+from nv_ingest_client.primitives.tasks import SplitTask
+from nv_ingest_client.primitives.tasks import StoreTask, StoreEmbedTask
+from nv_ingest_client.primitives.tasks import VdbUploadTask
+from nv_ingest_client.util.file_processing.extract import extract_file_content
+from IPython import display
+import logging
+logger = logging.getLogger(__name__)
+
+
+logging.basicConfig(filename='myapp.log', level=logging.INFO)
+logger.info("extract pdf file contents: ")
+file_content, file_type = extract_file_content(SAMPLE_PDF)
+logger.info("extracted file content")
+
+client = NvIngestClient(
+    message_client_allocator=RestClient,
+    message_client_hostname=HTTP_HOST,
+    message_client_port=HTTP_PORT,
+    message_client_kwargs=None,
+    msg_counter_id="nv-ingest-message-id",
+    worker_pool_size=1,
 )
 
-print("starting to ingest file: " )
-generated_metadata = ingestor.ingest()
-print("finish ingesting file! ")
+job_spec = JobSpec(
+    document_type=file_type,
+    payload=file_content,
+    source_id=SAMPLE_PDF,
+    source_name=SAMPLE_PDF,
+    extended_options={
+        "tracing_options": {
+            "trace": True,
+            "ts_send": time.time_ns(),
+        }
+    },
+)
+
+extract_task = ExtractTask(
+    document_type=file_type,
+    extract_text=True,
+    extract_images=True,
+    extract_tables=True,
+    text_depth="document",
+    extract_tables_method="yolox",
+)
+
+dedup_task = DedupTask(
+    content_type="image",
+    filter=False,
+)
+
+job_spec.add_task(extract_task)
+job_spec.add_task(dedup_task)
+
+job_id = client.add_job(job_spec)
+client.submit_job(job_id, TASK_QUEUE)
+generated_metadata = client.fetch_job_result(
+    job_id, timeout=DEFAULT_JOB_TIMEOUT
+)[0]
+
+print(type(generated_metadata))
+print(len(generated_metadata))
+
+
+def redact_metadata_helper(metadata: dict) -> dict:
+    """A simple helper function to redact `metadata["content"]` so improve readability."""
+    text_metadata_redact = metadata.copy()
+    text_metadata_redact["content"] = "<---Redacted for readability--->"
+    return text_metadata_redact
 
 
 
+def decode_base64_to_bitmap_and_save(base64_string, output_file_path):
+    try:
+        # Decode the base64 string to bytes
+        decoded_bytes = base64.b64decode(base64_string)
 
-def count_metadata_types(metadata: List[Dict[str, Any]]) -> Dict[str, int]:
-    """
-    Count the number of each metadata type in the generated metadata.
-    """
-    return dict(Counter(item['document_type'] for item in metadata))
+        # Create a BytesIO stream from the decoded bytes
+        byte_stream = BytesIO(decoded_bytes)
 
-def analyze_text_metadata(metadata: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Analyze text metadata and return key information.
-    """
-    text_items = [item for item in metadata if item['document_type'] == 'text']
-    if not text_items:
-        return {"error": "No text metadata found"}
-    
-    text_item = text_items[0]['metadata']
-    return {
-        "language": text_item['text_metadata']['language'],
-        "page_count": text_item['content_metadata']['hierarchy']['page_count'],
-        "source_name": text_item['source_metadata']['source_name'],
-        "content_preview": text_item['content'][:200] + "..."  # First 200 characters
-    }
+        # Open the image using Pillow (PIL)
+        decoded_bitmap = Image.open(byte_stream)
 
-def analyze_table_metadata(metadata: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Analyze table metadata and return key information for each table.
-    """
-    table_items = [item['metadata'] for item in metadata 
-                   if item['document_type'] == 'structured' 
-                   and item['metadata']['content_metadata']['subtype'] == 'table']
-    
-    return [{
-        "content_preview": table['table_metadata']['table_content'][:100] + "...",
-        "location": table['table_metadata']['table_location'],
-        "page_number": table['content_metadata']['page_number']
-    } for table in table_items]
+        # Save the decoded bitmap as a PNG file
+        decoded_bitmap.save(output_file_path, "PNG")
 
-def analyze_chart_metadata(metadata: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Analyze chart metadata and return key information for each chart.
-    """
-    chart_items = [item['metadata'] for item in metadata 
-                   if item['document_type'] == 'structured' 
-                   and item['metadata']['content_metadata']['subtype'] == 'chart']
-    
-    return [{
-        "content_preview": chart['table_metadata']['table_content'][:100] + "...",
-        "location": chart['table_metadata']['table_location'],
-        "page_number": chart['content_metadata']['page_number']
-    } for chart in chart_items]
+        return True  # Successful save
+    except Exception as e:
+        print(f"Error: {e}")
+        return False  # Saving failed
 
-def analyze_image_metadata(metadata: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Analyze image metadata and return key information for each image.
-    """
-    image_items = [item['metadata'] for item in metadata if item['document_type'] == 'image']
-    
-    return [{
-        "image_type": img['image_metadata']['image_type'],
-        "dimensions": f"{img['image_metadata']['width']}x{img['image_metadata']['height']}",
-        "location": img['image_metadata']['image_location'],
-        "page_number": img['content_metadata']['page_number']
-    } for img in image_items]
 
-def display_image(metadata: List[Dict[str, Any]], index: int = 0):
-    """
-    Display an image from the metadata at the specified index.
-    """
-    image_items = [item for item in metadata if item['document_type'] == 'image']
-    if index < 0 or index >= len(image_items):
-        print(f"Invalid index. There are {len(image_items)} images.")
-        return
-    
-    image_data = b64decode(image_items[index]['metadata']['content'])
-    display(Image(image_data))
-
-def comprehensive_metadata_analysis(metadata: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Perform a comprehensive analysis of the metadata and return a summary.
-    """
-    return {
-        "type_counts": count_metadata_types(metadata),
-        "text_analysis": analyze_text_metadata(metadata),
-        "table_analysis": analyze_table_metadata(metadata),
-        "chart_analysis": analyze_chart_metadata(metadata),
-        "image_analysis": analyze_image_metadata(metadata)
-    }
-
-def print_metadata_summary(analysis: Dict[str, Any]):
-    """
-    Print a formatted summary of the metadata analysis.
-    """
-    print("NV-Ingest Metadata Analysis Summary")
-    print("===================================")
-    
-    print("\nMetadata Type Counts:")
-    for doc_type, count in analysis['type_counts'].items():
-        print(f"  {doc_type}: {count}")
-    
-    print("\nText Analysis:")
-    text_analysis = analysis['text_analysis']
-    print(f"  Language: {text_analysis['language']}")
-    print(f"  Page Count: {text_analysis['page_count']}")
-    print(f"  Source Name: {text_analysis['source_name']}")
-    print(f"  Content Preview: {text_analysis['content_preview']}")
-    
-    print("\nTable Analysis:")
-    for i, table in enumerate(analysis['table_analysis'], 1):
-        print(f"  Table {i}:")
-        print(f"    Content Preview: {table['content_preview']}")
-        print(f"    Location: {table['location']}")
-        print(f"    Page Number: {table['page_number']}")
-    
-    print("\nChart Analysis:")
-    for i, chart in enumerate(analysis['chart_analysis'], 1):
-        print(f"  Chart {i}:")
-        print(f"    Content Preview: {chart['content_preview']}")
-        print(f"    Location: {chart['location']}")
-        print(f"    Page Number: {chart['page_number']}")
-    
-    print("\nImage Analysis:")
-    for i, image in enumerate(analysis['image_analysis'], 1):
-        print(f"  Image {i}:")
-        print(f"    Type: {image['image_type']}")
-        print(f"    Dimensions: {image['dimensions']}")
-        print(f"    Location: {image['location']}")
-        print(f"    Page Number: {image['page_number']}")
-
-print("generated meta data is: ", generated_metadata)
-analysis = comprehensive_metadata_analysis(generated_metadata[0])  # One analyze first file result
-print_metadata_summary(analysis)
-
-# To display an image:
-#display_image(generated_metadata[0], 0)  # Display the first image
+for i in range(len(generated_metadata)):
+    #if generated_metadata[i]['document_type'] == "image":
+    img_metadata = generated_metadata[i]["metadata"]
+    redact_metadata_helper(img_metadata)
+    output_file_path = "image_" + str(i+1) + ".png"
+    if decode_base64_to_bitmap_and_save(img_metadata["content"], output_file_path):
+        print(f"Image saved as {output_file_path}")
+    else:
+        print("Failed to decode and save the image.")
